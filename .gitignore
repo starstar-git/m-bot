@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+
+# PyInstaller build output
+build/
+dist/
+*.spec
+
+# IDE
+.vscode/
+.idea/
+
+# Qoder
+.qoder/
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Bundled third-party libraries (too large for GitHub)
+libs/
+
+# Sensitive or unnecessary logs
+*.log
