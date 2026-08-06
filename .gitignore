@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# CodeBuddy
+.codebuddy/
