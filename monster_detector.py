@@ -16,9 +16,12 @@ from PIL import ImageGrab
 class MonsterDetector:
     """怪物检测器 - 使用模板匹配"""
 
-    def __init__(self, monster_templates_dir='monsters'):
+    def __init__(self, monster_templates_dir='monsters', player_templates_dir='player',
+                 wall_templates_dir='wall', throwpoint_templates_dir='throwpoint'):
         self.monster_templates_dir = monster_templates_dir
-        self.player_templates_dir = 'player'
+        self.player_templates_dir = player_templates_dir
+        self.wall_templates_dir = wall_templates_dir
+        self.throwpoint_templates_dir = throwpoint_templates_dir
         self.templates = []
         self.template_names = []
         self.monster_groups = {}
@@ -26,6 +29,14 @@ class MonsterDetector:
         # 玩家模板缓存
         self.player_templates_cache = []  # [(template, name), ...]
         self._player_cache_loaded = False
+
+        # 墙面模板缓存
+        self.wall_templates_cache = []    # [(template, name), ...]
+        self._wall_cache_loaded = False
+
+        # 抛点模板缓存（原地移动抛点）
+        self.throwpoint_templates_cache = []   # [(template, name), ...]
+        self._throwpoint_cache_loaded = False
         
         # 玩家位置跟踪
         self.last_player_pos = None
@@ -36,6 +47,8 @@ class MonsterDetector:
         # 加载模板
         self.load_templates()
         self.load_player_templates()
+        self.load_wall_templates()
+        self.load_throwpoint_templates()
 
     def _flip_image(self, img):
         """水平翻转图像（生成左右方向图片）"""
@@ -141,9 +154,12 @@ class MonsterDetector:
         img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
         return img
 
-    def detect_monsters(self, threshold=0.7, region=None):
-        """检测屏幕中的怪物（带去重逻辑）"""
-        screen = self.capture_screen(region)
+    def detect_monsters(self, threshold=0.7, region=None, screen=None):
+        """检测屏幕中的怪物（带去重逻辑）。
+        可传入已截取的 screen（BGR 数组）避免重复截图；不传则自动截图。
+        """
+        if screen is None:
+            screen = self.capture_screen(region)
         detected = []
 
         for i, template in enumerate(self.templates):
@@ -175,6 +191,85 @@ class MonsterDetector:
         # 去重：合并距离相近的检测结果（同一个怪物可能被多个模板匹配）
         return self._remove_duplicates(detected)
     
+    def detect_all_in_one(self, threshold=0.7, player_threshold=0.7, region=None):
+        """一次截图，同时检测玩家和怪物，避免重复截图（性能优化）。
+
+        返回 dict:
+            {
+                'screen': 截取的BGR图像,
+                'player_info': 玩家检测结果或None,
+                'monsters': 怪物列表(已去重)或None
+            }
+        """
+        screen = self.capture_screen(region)
+
+        # 玩家检测
+        player_info = None
+        if self._player_cache_loaded and self.player_templates_cache:
+            player_info = self._match_player(screen, player_threshold)
+
+        # 怪物检测
+        monsters = None
+        if self.templates:
+            monsters = self.detect_monsters(threshold=threshold, screen=screen)
+
+        return {
+            'screen': screen,
+            'player_info': player_info,
+            'monsters': monsters,
+        }
+
+    def _match_player(self, screen, threshold=0.7):
+        """在给定截图中匹配玩家位置（不截图，不更新丢失计数外的状态）"""
+        if not self.player_templates_cache:
+            return None
+
+        player_positions = []
+        for template, template_name in self.player_templates_cache:
+            result = cv2.matchTemplate(screen, template, cv2.TM_CCOEFF_NORMED)
+            locations = np.where(result >= threshold)
+
+            for pt in zip(*locations[::-1]):
+                h, w = template.shape[:2]
+                center_x = pt[0] + w // 2
+                center_y = pt[1] + h // 2
+
+                player_positions.append({
+                    'position': (center_x, center_y),
+                    'confidence': result[pt[1], pt[0]],
+                    'bbox': (pt[0], pt[1], pt[0] + w, pt[1] + h),
+                    'template': template_name
+                })
+
+        if not player_positions:
+            self.player_lost_count += 1
+            return None
+
+        player_positions.sort(key=lambda x: x['confidence'], reverse=True)
+
+        # 用向量预测位置辅助选择（避免模板误匹配到别的同名目标）
+        # 优先用运动趋势外推的预测点作锚点，比直接用 last_player_pos 更贴合真实位置
+        anchor = self.predict_player_pos() or self.last_player_pos
+        if anchor:
+            px, py = anchor
+            min_distance = float('inf')
+            best_match = None
+            for pos in player_positions[:5]:
+                dx = pos['position'][0] - px
+                dy = pos['position'][1] - py
+                distance = (dx ** 2 + dy ** 2) ** 0.5
+                if distance < 200 and distance < min_distance:
+                    min_distance = distance
+                    best_match = pos
+            if best_match:
+                self.player_lost_count = 0
+                self.update_player_history(best_match['position'])
+                return best_match
+
+        self.player_lost_count = 0
+        self.update_player_history(player_positions[0]['position'])
+        return player_positions[0]
+
     def _remove_duplicates(self, detected, overlap_threshold=0.5):
         """去除重复检测结果（基于边界框重叠判断）"""
         if not detected:
@@ -310,22 +405,185 @@ class MonsterDetector:
         self._player_cache_loaded = True
         print(f"共加载 {len(self.player_templates_cache)} 个玩家模板")
 
-    def detect_player_by_name(self, player_name, threshold=0.7, region=None):
-        """通过玩家名字图片模板匹配检测玩家位置（使用内存缓存）"""
-        if not os.path.exists(self.player_templates_dir):
-            print("请添加玩家图片到 player 目录")
-            return None
+    def load_wall_templates(self):
+        """加载墙面模板到内存缓存（启动时加载一次，墙面无需翻转图）"""
+        self.wall_templates_cache = []
+        self._wall_cache_loaded = False
 
+        if not os.path.exists(self.wall_templates_dir):
+            return
+
+        for filename in os.listdir(self.wall_templates_dir):
+            if filename.endswith('.png') or filename.endswith('.jpg'):
+                path = os.path.join(self.wall_templates_dir, filename)
+                template = cv2.imread(path)
+                if template is not None:
+                    self.wall_templates_cache.append((template, filename))
+                    print(f"加载墙面模板: {filename}")
+
+        self._wall_cache_loaded = True
+        print(f"共加载 {len(self.wall_templates_cache)} 个墙面模板")
+
+    def detect_walls(self, threshold=0.7, region=None, screen=None):
+        """检测屏幕中的墙面（模板匹配，带去重）。
+        可传入已截取的 screen（BGR 数组）避免重复截图；不传则自动截图。
+        """
         # 确保缓存已加载
+        if not self._wall_cache_loaded:
+            self.load_wall_templates()
+
+        if not self.wall_templates_cache:
+            return []
+
+        if screen is None:
+            screen = self.capture_screen(region)
+
+        detected = []
+        for template, template_name in self.wall_templates_cache:
+            result = cv2.matchTemplate(screen, template, cv2.TM_CCOEFF_NORMED)
+            locations = np.where(result >= threshold)
+
+            for pt in zip(*locations[::-1]):
+                h, w = template.shape[:2]
+                center_x = pt[0] + w // 2
+                center_y = pt[1] + h // 2
+                detected.append({
+                    'name': template_name,
+                    'position': (center_x, center_y),
+                    'confidence': result[pt[1], pt[0]],
+                    'bbox': (pt[0], pt[1], pt[0] + w, pt[1] + h),
+                    'template_size': (w, h)
+                })
+
+        detected.sort(key=lambda x: x['confidence'], reverse=True)
+        return self._remove_duplicates(detected)
+
+    def add_wall_template(self, image_path, name=None):
+        """添加墙面模板图片（墙面无需左右翻转，直接保存原图）"""
+        wall_dir = self.wall_templates_dir
+        if not os.path.exists(wall_dir):
+            os.makedirs(wall_dir)
+
+        template = cv2.imread(image_path)
+        if template is None:
+            print(f"无法加载图片: {image_path}")
+            return False
+
+        if name is None:
+            name = os.path.basename(image_path)
+
+        save_path = os.path.join(wall_dir, name)
+        # 墙面不生成左右翻转图，直接保存原图
+        cv2.imwrite(save_path, template)
+        print(f"添加墙面模板: {save_path}")
+        return True
+
+    def get_wall_template_count(self):
+        """获取墙面模板数量"""
+        if not os.path.exists(self.wall_templates_dir):
+            return 0
+        count = 0
+        for filename in os.listdir(self.wall_templates_dir):
+            if filename.endswith(('.png', '.jpg')):
+                count += 1
+        return count
+
+    def load_throwpoint_templates(self):
+        """加载抛点模板到内存缓存（启动时加载一次，抛点无需翻转图）"""
+        self.throwpoint_templates_cache = []
+        self._throwpoint_cache_loaded = False
+
+        if not os.path.exists(self.throwpoint_templates_dir):
+            return
+
+        for filename in os.listdir(self.throwpoint_templates_dir):
+            if filename.endswith('.png') or filename.endswith('.jpg'):
+                path = os.path.join(self.throwpoint_templates_dir, filename)
+                template = cv2.imread(path)
+                if template is not None:
+                    self.throwpoint_templates_cache.append((template, filename))
+                    print(f"加载抛点模板: {filename}")
+
+        self._throwpoint_cache_loaded = True
+        print(f"共加载 {len(self.throwpoint_templates_cache)} 个抛点模板")
+
+    def detect_throwpoint(self, threshold=0.7, region=None, screen=None):
+        """检测屏幕中的抛点（模板匹配，带去重）。
+        可传入已截取的 screen（BGR 数组）避免重复截图；不传则自动截图。
+        返回抛点列表；未检测到返回空列表。
+        """
+        if not self._throwpoint_cache_loaded:
+            self.load_throwpoint_templates()
+
+        if not self.throwpoint_templates_cache:
+            return []
+
+        if screen is None:
+            screen = self.capture_screen(region)
+
+        detected = []
+        for template, template_name in self.throwpoint_templates_cache:
+            result = cv2.matchTemplate(screen, template, cv2.TM_CCOEFF_NORMED)
+            locations = np.where(result >= threshold)
+
+            for pt in zip(*locations[::-1]):
+                h, w = template.shape[:2]
+                center_x = pt[0] + w // 2
+                center_y = pt[1] + h // 2
+                detected.append({
+                    'name': template_name,
+                    'position': (center_x, center_y),
+                    'confidence': result[pt[1], pt[0]],
+                    'bbox': (pt[0], pt[1], pt[0] + w, pt[1] + h),
+                    'template_size': (w, h)
+                })
+
+        detected.sort(key=lambda x: x['confidence'], reverse=True)
+        return self._remove_duplicates(detected)
+
+    def add_throwpoint_template(self, image_path, name=None):
+        """添加抛点模板图片（抛点无需左右翻转，直接保存原图）"""
+        tp_dir = self.throwpoint_templates_dir
+        if not os.path.exists(tp_dir):
+            os.makedirs(tp_dir)
+
+        template = cv2.imread(image_path)
+        if template is None:
+            print(f"无法加载图片: {image_path}")
+            return False
+
+        if name is None:
+            name = os.path.basename(image_path)
+
+        save_path = os.path.join(tp_dir, name)
+        cv2.imwrite(save_path, template)
+        print(f"添加抛点模板: {save_path}")
+        return True
+
+    def get_throwpoint_template_count(self):
+        """获取抛点模板数量"""
+        if not os.path.exists(self.throwpoint_templates_dir):
+            return 0
+        count = 0
+        for filename in os.listdir(self.throwpoint_templates_dir):
+            if filename.endswith(('.png', '.jpg')):
+                count += 1
+        return count
+
+    def detect_player_by_name(self, player_name, threshold=0.7, region=None, screen=None):
+        """通过玩家名字图片模板匹配检测玩家位置（使用内存缓存）。
+        可传入已截取的 screen（BGR 数组）避免重复截图；不传则自动截图。
+        """
+        # 确保缓存已加载（仅首次调用时读盘，此后使用内存缓存）
         if not self._player_cache_loaded:
             self.load_player_templates()
-        
+
         if not self.player_templates_cache:
-            print("player目录中没有找到图片模板")
             return None
 
-        screen = self.capture_screen(region)
-        
+        if screen is None:
+            screen = self.capture_screen(region)
+
         player_positions = []
         
         for template, template_name in self.player_templates_cache:
@@ -381,6 +639,42 @@ class MonsterDetector:
         if len(self.player_pos_history) > self.max_history:
             self.player_pos_history.pop(0)
         self.last_player_pos = pos
+
+    def get_motion_vector(self):
+        """计算最近的运动向量（位移方向），基于玩家位置历史。
+
+        返回 (dx, dy) 表示最近一帧的位移（从上一帧到当前帧）。
+        历史不足两帧时返回 (0, 0)。
+        """
+        if len(self.player_pos_history) >= 2:
+            p_prev = self.player_pos_history[-2]
+            p_curr = self.player_pos_history[-1]
+            return (p_curr[0] - p_prev[0], p_curr[1] - p_prev[1])
+        return (0, 0)
+
+    def predict_player_pos(self, max_extrapolate=120):
+        """向量外推预测玩家当前位置。
+
+        利用历史坐标计算运动向量，从最后位置沿运动方向外推一步，
+        用于玩家丢失时估计其真实位置，比"静止假设"更准。
+        - 历史不足两帧时退化为返回 last_player_pos（静止假设）。
+        - 外推距离限制在 max_extrapolate 内，避免急停/转弯时过冲。
+        """
+        if self.last_player_pos is None:
+            return None
+
+        dx, dy = self.get_motion_vector()
+        if dx == 0 and dy == 0:
+            return self.last_player_pos
+
+        # 限制单步外推位移长度，防止过冲
+        length = (dx * dx + dy * dy) ** 0.5
+        if length > max_extrapolate:
+            scale = max_extrapolate / length
+            dx, dy = dx * scale, dy * scale
+
+        return (self.last_player_pos[0] + int(dx),
+                self.last_player_pos[1] + int(dy))
 
     def add_player_template(self, image_path, name=None):
         """添加玩家名字模板（同时生成左右方向图片）"""

@@ -34,6 +34,7 @@ class KeyboardController:
             'alt': Key.alt,
             'backspace': Key.backspace,
             'delete': Key.delete,
+            'end': Key.end,
             'numpad0': '0',
             'numpad1': '1',
             'numpad2': '2',
