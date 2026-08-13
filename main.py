@@ -115,6 +115,7 @@ class MapleStoryBot:
             'predicted_pos': None,   # 向量外推预测的玩家位置（丢失时使用）
             'walls': [],             # 本帧墙面列表（启用墙面检测时更新）
             'throwpoint': None,      # 本帧抛点位置（启用抛点检测时更新）(x,y)
+            'stuck_count': 0,        # 连续卡住检测次数（玩家坐标几乎不变时+1）
             'detect_frame': 0,       # 检测帧计数（每次检测线程更新+1）
             'ready': False,          # 是否已产生第一帧结果
         }
@@ -461,10 +462,10 @@ class MapleStoryBot:
         # 跳墙状态：记录上次跳墙的检测帧（避免同一帧重复跳）
         self._last_wall_jump_frame = -1
         self._last_wall_jump_time = 0.0
-        # 墙面检测触发：仅当人物卡在同一坐标时才进行墙面检测（降低开销）
-        self._detect_pos_history = []
         # 黑屏报警：记录上次报警时间，防重复报警
         self._last_black_alert_time = 0.0
+        # 卡住检测：记录上次检测到的玩家位置（用于连续坐标几乎不变的判断）
+        self._last_detected_pos = None
         # 重置共享检测状态
         with self._state_lock:
             self._state['player_pos'] = None
@@ -475,6 +476,7 @@ class MapleStoryBot:
             self._state['nearest'] = None
             self._state['predicted_pos'] = None
             self._state['walls'] = []
+            self._state['stuck_count'] = 0
             self._state['detect_frame'] = 0
             self._state['ready'] = False
         self.start_btn.config(state=tk.DISABLED)
@@ -688,7 +690,8 @@ class MapleStoryBot:
     def _check_wall_jump(self, player_pos, walls, patrol_dir, detect_frame, move_keys=None):
         """巡逻时判断人物是否碰撞墙面，碰墙后根据配置执行跳跃或转向。
 
-        直接用检测线程实时检测到的墙面数据（walls）判断碰撞，不记录预测历史坐标。
+        墙面检测启用后每帧都会检测墙面数据（walls）。只要人物前后100像素、
+        上下50像素范围内检测到墙面，即视为碰墙，并按照配置的碰墙动作（跳跃/转向）执行。
         返回 True 表示执行了跳跃/转向。
         """
         if player_pos is None:
@@ -702,8 +705,8 @@ class MapleStoryBot:
             return False
 
         px, py = player_pos
-        tol_x = 50   # 人物与墙面中心的水平碰撞阈值
-        tol_y = 50   # 人物与墙面中心的垂直碰撞阈值
+        tol_x = 100  # 人物前后100像素范围内检测到墙面即视为碰撞（水平）
+        tol_y = 50   # 人物上下50像素范围内检测到墙面即视为碰撞（垂直）
 
         # 直接用实时检测到的墙面数据判断碰撞（不记录/复用预测历史坐标）
         for wall in (walls or []):
@@ -729,8 +732,6 @@ class MapleStoryBot:
                     self._do_move(back_dir)
                     print(f"[碰墙] 巡逻 {patrol_dir} 碰撞墙面，转向: {back_dir} (墙: ({int(wall_cx)},{int(wall_cy)}))")
 
-                # 碰墙后刷新墙面检测的位置历史，重新累计（跳跃/转向后需要重新判定卡住）
-                self._detect_pos_history.clear()
                 return True
         return False
 
@@ -799,31 +800,30 @@ class MapleStoryBot:
         # 向量外推预测位置
         predicted_pos = self.detector.predict_player_pos()
 
-        # === 墙面检测（降低开销：人物疑似卡住时立即检测） ===
+        # === 卡住检测：玩家坐标连续几乎不变则累加计数，供巡逻时换方向 ===
+        stuck_count = 0
+        if player_info is not None:
+            pos = player_info['position']
+            if self._last_detected_pos is not None:
+                prev = self._last_detected_pos
+                # 前后8像素内几乎不动视为卡住
+                if abs(pos[0] - prev[0]) <= 8 and abs(pos[1] - prev[1]) <= 8:
+                    stuck_count = (self._state.get('stuck_count', 0) + 1)
+                else:
+                    stuck_count = 0
+            self._last_detected_pos = pos
+        else:
+            # 玩家丢失时无法判断是否卡住，清零
+            self._last_detected_pos = None
+            stuck_count = 0
+
+        # === 墙面检测（启用后每帧检测，不再依赖"人物卡住"判断） ===
         walls = []
         if self.config['use_wall_detection']:
-            if player_info is not None:
-                pos = player_info['position']
-                self._detect_pos_history.append(pos)
-                if len(self._detect_pos_history) > 10:
-                    self._detect_pos_history.pop(0)
-            else:
-                self._detect_pos_history.clear()
-
-            # 判定人物是否疑似卡住：对比上一个坐标，前后8像素内都算卡住
-            stuck = False
-            if len(self._detect_pos_history) >= 2:
-                prev = self._detect_pos_history[-2]
-                cur = self._detect_pos_history[-1]
-                if abs(cur[0] - prev[0]) <= 8 and abs(cur[1] - prev[1]) <= 8:
-                    stuck = True
-
-            # 判定为卡住后立即执行墙面检测
-            if stuck:
-                walls = self.detector.detect_walls(
-                    threshold=self.config['wall_threshold'],
-                    screen=result['screen']
-                )
+            walls = self.detector.detect_walls(
+                threshold=self.config['wall_threshold'],
+                screen=result['screen']
+            )
 
         # === 抛点检测（原地移动抛点）：启用时检测抛点位置 ===
         throwpoint = None
@@ -884,6 +884,7 @@ class MapleStoryBot:
             self._state['predicted_pos'] = predicted_pos
             self._state['walls'] = walls
             self._state['throwpoint'] = throwpoint
+            self._state['stuck_count'] = stuck_count
             self._state['detect_frame'] += 1
             self._state['ready'] = True
 
@@ -925,6 +926,7 @@ class MapleStoryBot:
                 predicted_pos = state['predicted_pos']
                 walls = state['walls']
                 throwpoint = state['throwpoint']
+                stuck_count = state.get('stuck_count', 0)
                 detect_frame = state['detect_frame']
 
                 # 未产生第一帧结果时先等待检测线程（多线程模式需要；单线程模式已有结果）
@@ -1223,7 +1225,14 @@ class MapleStoryBot:
                             print(f"[回区域] 人物在区域外(judge_x={int(judge_x)})，转向: {back_dir}")
                         else:
                             # 人物在区域内：左右巡逻
-                            # 巡逻时若前方有墙面且距离<=50，碰墙后根据选项跳跃或转向
+                            # 巡逻时人物前后100/上下50范围内检测到墙面，碰墙后根据选项跳跃或转向
+                            # 卡住检测：连续10次检测坐标几乎不变，则跳一下尝试越过障碍
+                            if stuck_count >= 10:
+                                self.kb_controller.press_key(self.config['jump_key'], 0.1)
+                                print(f"[卡住] 连续{stuck_count}次检测坐标几乎不变，跳跃尝试越障")
+                                # 重置卡住计数，避免同一帧重复触发（下一帧从0重新累计）
+                                with self._state_lock:
+                                    self._state['stuck_count'] = 0
                             self._check_wall_jump(
                                 player_pos, walls, self._patrol_direction, detect_frame, move_keys
                             )
@@ -1338,7 +1347,7 @@ class MapleStoryBot:
     
     def detect_game_window(self):
         """尝试检测游戏窗口（支持多个窗口标题，依次查找，兼容新老版本）"""
-        # 依次尝试的窗口标题：优先冒险岛怀旧服，找不到再回退到旧版 MapleStory
+        # 依次尝试的窗口标题：优先怀旧服，找不到再回退到旧版 
         window_titles = ["冒险岛怀旧服", "MapleStory"]
         try:
             hwnd = None
